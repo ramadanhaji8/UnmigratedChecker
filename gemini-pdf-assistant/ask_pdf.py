@@ -12,24 +12,20 @@ import argparse
 import os
 import sys
 import time
-import warnings
 from pathlib import Path
 
-# google-generativeai prints a deprecation banner on every import; keep the CLI output clean.
-warnings.filterwarnings("ignore", category=FutureWarning, message=r"(?s).*google\.generativeai")
-
-import google.generativeai as genai
 from dotenv import load_dotenv
-from google.api_core import exceptions as google_exceptions
+from google import genai
+from google.genai import errors, types
 
-DEFAULT_MODEL = "gemini-1.5-flash"
+DEFAULT_MODEL = "gemini-2.5-flash"
 
 # Seconds between status checks while Gemini processes the uploaded file.
 POLL_INTERVAL_SECONDS = 2
 # Maximum time to wait for file processing before giving up.
 PROCESSING_TIMEOUT_SECONDS = 300
 # Large documents can take a while to answer; the default HTTP timeout is too short.
-GENERATION_TIMEOUT_SECONDS = 600
+REQUEST_TIMEOUT_SECONDS = 600
 
 SYSTEM_PROMPT_TEMPLATE = """Du er en fagspecifik AI-assistent for en bygningskonstruktørstuderende i Danmark. Din opgave er at analysere de vedhæftede byggetekniske dokumenter og levere præcise, teknisk funderede svar.
 
@@ -72,28 +68,26 @@ def load_api_key() -> str:
     return api_key
 
 
-def wait_for_processing(uploaded_file):
+def wait_for_processing(client: genai.Client, uploaded_file: types.File) -> types.File:
     """Poll the File API until the uploaded file is ACTIVE."""
     deadline = time.monotonic() + PROCESSING_TIMEOUT_SECONDS
-    while uploaded_file.state.name == "PROCESSING":
+    while uploaded_file.state == types.FileState.PROCESSING:
         if time.monotonic() > deadline:
             raise TimeoutError("Gemini blev ikke færdig med at behandle filen i tide.")
         print("Venter på at Gemini behandler filen...", file=sys.stderr)
         time.sleep(POLL_INTERVAL_SECONDS)
-        uploaded_file = genai.get_file(uploaded_file.name)
+        uploaded_file = client.files.get(name=uploaded_file.name)
 
-    if uploaded_file.state.name != "ACTIVE":
-        raise RuntimeError(f"Filbehandling mislykkedes (status: {uploaded_file.state.name}).")
+    if uploaded_file.state != types.FileState.ACTIVE:
+        raise RuntimeError(f"Filbehandling mislykkedes (status: {uploaded_file.state}).")
     return uploaded_file
 
 
-def extract_text(response) -> str:
-    try:
-        return response.text
-    except ValueError:
-        # Raised when the response has no text, e.g. because it was blocked.
-        feedback = getattr(response, "prompt_feedback", None)
-        raise RuntimeError(f"Modellen returnerede intet svar. Feedback: {feedback}") from None
+def extract_text(response: types.GenerateContentResponse) -> str:
+    # response.text is None when there is no text, e.g. because the answer was blocked.
+    if not response.text:
+        raise RuntimeError(f"Modellen returnerede intet svar. Feedback: {response.prompt_feedback}")
+    return response.text
 
 
 def main() -> None:
@@ -105,35 +99,41 @@ def main() -> None:
     if pdf_path.suffix.lower() != ".pdf":
         fail(f"Filen er ikke en PDF: {pdf_path}")
 
-    genai.configure(api_key=load_api_key())
-    model = genai.GenerativeModel(args.model)
+    client = genai.Client(
+        api_key=load_api_key(),
+        http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_SECONDS * 1000),
+    )
     prompt = SYSTEM_PROMPT_TEMPLATE.format(user_question=args.question)
 
     print(f"Uploader {pdf_path.name}...", file=sys.stderr)
-    uploaded_file = genai.upload_file(
-        path=str(pdf_path),
-        mime_type="application/pdf",
-        display_name=pdf_path.name,
-    )
+    try:
+        uploaded_file = client.files.upload(
+            file=pdf_path,
+            config=types.UploadFileConfig(mime_type="application/pdf", display_name=pdf_path.name),
+        )
+    except errors.APIError as exc:
+        fail(f"Upload mislykkedes: {exc}")
 
     try:
-        uploaded_file = wait_for_processing(uploaded_file)
+        uploaded_file = wait_for_processing(client, uploaded_file)
         print(f"Analyserer dokumentet med {args.model}...\n", file=sys.stderr)
-        response = model.generate_content(
-            [uploaded_file, prompt],
-            request_options={"timeout": GENERATION_TIMEOUT_SECONDS},
+        response = client.models.generate_content(
+            model=args.model,
+            contents=[uploaded_file, prompt],
         )
         print(extract_text(response))
-    except google_exceptions.NotFound as exc:
-        fail(f"Modellen '{args.model}' blev ikke fundet. Prøv en anden med --model. ({exc})")
-    except (google_exceptions.GoogleAPIError, RuntimeError, TimeoutError) as exc:
+    except errors.APIError as exc:
+        if exc.code == 404:
+            fail(f"Modellen '{args.model}' blev ikke fundet. Prøv en anden med --model. ({exc})")
+        fail(str(exc))
+    except (RuntimeError, TimeoutError) as exc:
         fail(str(exc))
     finally:
         # Always clean up the uploaded file, even if generation failed.
         try:
-            genai.delete_file(uploaded_file.name)
+            client.files.delete(name=uploaded_file.name)
             print("\nDen uploadede fil er slettet fra Gemini.", file=sys.stderr)
-        except google_exceptions.GoogleAPIError as exc:
+        except errors.APIError as exc:
             print(f"Advarsel: Kunne ikke slette filen {uploaded_file.name}: {exc}", file=sys.stderr)
 
 

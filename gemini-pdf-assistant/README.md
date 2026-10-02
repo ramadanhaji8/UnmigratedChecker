@@ -47,10 +47,10 @@ Eksempel:
 python ask_pdf.py BR18.pdf "Hvad er kravet til mindste taghældning for tegltag?"
 ```
 
-Vil du bruge en anden Gemini-model, kan du angive den med `--model`:
+Scriptet bruger `gemini-2.5-flash` som standard. Vil du bruge en anden Gemini-model (f.eks. den mere grundige `gemini-2.5-pro`), kan du angive den med `--model`:
 
 ```bash
-python ask_pdf.py BR18.pdf "Dit spørgsmål" --model gemini-2.5-flash
+python ask_pdf.py BR18.pdf "Dit spørgsmål" --model gemini-2.5-pro
 ```
 
 Statusbeskeder skrives til stderr, så du kan gemme selve svaret i en fil:
